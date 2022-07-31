@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,6 +58,7 @@ type NetConf struct {
 	Vlan         int    `json:"vlan"`
 	MacSpoofChk  bool   `json:"macspoofchk,omitempty"`
 	EnableDad    bool   `json:"enabledad,omitempty"`
+	BridgeNS     string `json:"bridgeNS,omitempty"`
 
 	Args struct {
 		Cni BridgeArgs `json:"cni,omitempty"`
@@ -406,12 +408,72 @@ func enableIPForward(family int) error {
 	return ip.EnableIP6Forward()
 }
 
+func createNetNS(bridgeNSPath string) error {
+	const selfNSPath = "/proc/self/ns/net"
+
+	if err := syscall.Unshare(syscall.CLONE_NEWNET); err != nil {
+		return fmt.Errorf("failed to create new netns %q: %v", bridgeNSPath, err)
+	}
+
+	if file, err := os.Create(bridgeNSPath); err != nil {
+		return fmt.Errorf("failed to bind new netns %q: %v", bridgeNSPath, err)
+	} else {
+		file.Close()
+	}
+
+	if err := syscall.Mount(selfNSPath, bridgeNSPath, "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("failed to bind new netns %q: %v", bridgeNSPath, err)
+	}
+
+	return nil
+}
+
+func switchToBridgeNS(conf *NetConf) error {
+	// No beidgeNS means stay in the root netns, as usual
+	if conf.BridgeNS == "" {
+		return nil
+	}
+
+	// If the bridge netns contains slashes, use it verbatim and do not try to create it.
+	// Otherwise, look for /run/netns/$BRIDGENS and create it if it does not exists.
+	bridgeNSPath := conf.BridgeNS
+	nsNeedsCreation := false
+	if !strings.ContainsRune(bridgeNSPath, '/') {
+		bridgeNSPath = "/run/netns/" + bridgeNSPath
+		nsNeedsCreation = true
+	}
+
+	bridgeNS, err := ns.GetNS(bridgeNSPath)
+	if _, ok := err.(ns.NSPathNotExistErr); ok && nsNeedsCreation {
+		err = createNetNS(bridgeNSPath)
+		if err == nil {
+			bridgeNS, err = ns.GetNS(bridgeNSPath)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("failed to open netns %q: %v", conf.BridgeNS, err)
+	}
+	// Won't need to keep this file around once the netns has been set.
+	defer bridgeNS.Close()
+
+	err = bridgeNS.Set()
+	if err != nil {
+		return fmt.Errorf("failed to enter netns %q: %v", conf.BridgeNS, err)
+	}
+
+	return nil
+}
+
 func cmdAdd(args *skel.CmdArgs) error {
 	var success bool = false
 
 	n, cniVersion, err := loadNetConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
+	}
+
+	if err = switchToBridgeNS(n); err != nil {
+		return fmt.Errorf("cannot switch to the bridge netns: %s", err)
 	}
 
 	isLayer3 := n.IPAM.Type != ""
@@ -638,6 +700,10 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 
+	if err = switchToBridgeNS(n); err != nil {
+		return fmt.Errorf("cannot switch to the bridge netns: %s", err)
+	}
+
 	isLayer3 := n.IPAM.Type != ""
 
 	ipamDel := func() error {
@@ -850,6 +916,11 @@ func cmdCheck(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
+
+	if err = switchToBridgeNS(n); err != nil {
+		return fmt.Errorf("cannot switch to the bridge netns: %s", err)
+	}
+
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
 		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
